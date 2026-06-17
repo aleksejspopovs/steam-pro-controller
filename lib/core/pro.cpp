@@ -113,11 +113,6 @@ void spi_read(uint32_t addr, size_t len, uint8_t* out) {
 
 // ---- controller state machine ----
 
-// Fresh identity: the Switch registers the controller (it sends the BT pairing
-// subcmd 0x01 even over USB) and may cache per-controller state keyed by this
-// MAC. Early broken-firmware sessions could have poisoned that cache; since we
-// always re-flashed with the same MAC we'd keep hitting it. Changed to force
-// the Switch to treat us as a brand-new controller. (Nintendo OUI 7C:BB:8A.)
 static const uint8_t MAC[6] = {0x7C, 0xBB, 0x8A, 0x12, 0x34, 0x56};
 
 void Controller::reset() {
