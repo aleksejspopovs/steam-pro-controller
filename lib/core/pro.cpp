@@ -425,13 +425,13 @@ inline int32_t clampq(double x, int32_t lo, int32_t hi) {
     return (int32_t)v;
 }
 
+} // namespace
+
 // Choose the packing mode adaptively and write the 36-byte motion region.
 // All three modes drop each sample's largest component (rebuildable from
 // ||q||=1) and canonicalise it positive; the difference is how the triplet is
 // represented (see pro.h / tools/sim_quat_packing.py for the precision/range
 // trade-offs). Inverse of the decoders in tools/decode_mode2.py.
-} // namespace
-
 void pack_quat_motion(uint8_t region[36], const double qf[4], const double qm[4],
                       const double ql[4], uint32_t ts_ms) {
     // mode 1/2 share one dropped index, taken from the mid sample and sign-
