@@ -24,6 +24,17 @@ constexpr uint64_t REPORT_PERIOD_US = 15000; // USB Pro Controller cadence
 // colors @0x6050, user-cal magics @0x8010/0x801b/0x8026 absent (0xFF).
 void spi_read(uint32_t addr, size_t len, uint8_t* out);
 
+// Pack three 5 ms-spaced orientation samples (first/mid/last, each a unit
+// quaternion x,y,z,w) into the 36-byte motion region of a 0x30 report, choosing
+// the Switch packing mode adaptively (see pro.cpp / tools/sim_quat_packing.py):
+//   mode 2 for slow/steady motion (21-bit absolute, tiny delta range),
+//   mode 1 for fast-but-smooth motion (16-bit endpoints, larger mid delta),
+//   mode 0 for erratic motion (three independent 13-bit quaternions).
+// `region` is out+13 of the report; ts_ms is the report timestamp. Exposed for
+// the golden-byte / round-trip tests.
+void pack_quat_motion(uint8_t region[36], const double qf[4], const double qm[4],
+                      const double ql[4], uint32_t ts_ms);
+
 // A captured SPI flash write (subcmd 0x11). We don't persist these -- the
 // Switch writes user calibration here (sticks @0x8010/0x801b, 6-axis @0x8026)
 // during its calibration UI -- but we hand the payload up so the harness can
