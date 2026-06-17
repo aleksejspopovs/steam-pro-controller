@@ -1,3 +1,4 @@
 - Fully implement and calibrate HD rumble
+- Implement more packing modes in IMU mode 2
 - Add defensive logging to detect unimplemented functionality (IMU mode 3? IMU sensitivity adjustment?)
 - Add rebinding capabilities (read from SD?) and utilize the extra buttons
