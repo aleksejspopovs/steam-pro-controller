@@ -1,0 +1,5 @@
+/.pio/
+
+# Vendored at build time by vendor_usbhost_t36.py from the installed Teensy
+# framework, then patched (see that script). Not source -- regenerated on demand.
+/lib/USBHost_t36/
