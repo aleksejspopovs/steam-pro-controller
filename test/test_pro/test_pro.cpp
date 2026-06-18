@@ -2,6 +2,7 @@
 // 0x30 report golden bytes, HD-rumble decode (table inversion).
 #include <unity.h>
 
+#include <cmath>
 #include <cstring>
 
 #include "pro.h"
@@ -236,6 +237,161 @@ static void test_report30_imu_samples(void) {
         TEST_ASSERT_EQUAL_HEX8_ARRAY(want, r + 13 + 12 * i, 12);
 }
 
+// ---- adaptive quaternion packing (modes 0/1/2) ----
+//
+// Independent decoder for the 36-byte motion region: reads the contiguous
+// LSB-first 144-bit gyro stream back out of the three accel gaps and rebuilds
+// the first/mid/last orientations, then we check the chosen mode + round-trip
+// accuracy against the quaternions we packed. Mirrors tools/sim_quat_packing.py.
+
+namespace {
+struct GyroBitReader {
+    uint8_t buf[18];
+    int pos = 0;
+    explicit GyroBitReader(const uint8_t* region) {
+        for (int g = 0; g < 3; g++) memcpy(buf + 6 * g, region + 6 + 12 * g, 6);
+    }
+    uint32_t get(int width) {
+        uint32_t v = 0;
+        for (int k = 0; k < width; k++) {
+            if ((buf[pos >> 3] >> (pos & 7)) & 1u) v |= (1u << k);
+            pos++;
+        }
+        return v;
+    }
+};
+int32_t sext(uint32_t v, int width) {
+    return (v & (1u << (width - 1))) ? (int32_t)(v - (1u << width)) : (int32_t)v;
+}
+void rebuild(const double c[3], int mi, double q[4]) {
+    for (int i = 0; i < 3; i++) q[(mi + i + 1) & 3] = c[i];
+    double s = 1.0 - (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
+    q[mi] = sqrt(s < 0 ? 0 : s);
+}
+int decode_region(const uint8_t* region, double qf[4], double qm[4], double ql[4]) {
+    GyroBitReader r(region);
+    int mode = r.get(2);
+    if (mode == 2) {
+        int mi = r.get(2);
+        double last[3], dlf[3], dma[3];
+        for (int i = 0; i < 3; i++) last[i] = sext(r.get(21), 21) / 1048576.0;
+        for (int i = 0; i < 3; i++) dlf[i] = sext(r.get(13), 13) / 1048576.0;
+        for (int i = 0; i < 3; i++) dma[i] = sext(r.get(7), 7) / 1048576.0;
+        double cf[3], cm[3];
+        for (int i = 0; i < 3; i++) {
+            cf[i] = last[i] - dlf[i];
+            cm[i] = 0.5 * (cf[i] + last[i]) + dma[i];
+        }
+        rebuild(cf, mi, qf); rebuild(cm, mi, qm); rebuild(last, mi, ql);
+    } else if (mode == 1) {
+        int div4 = r.get(1), mi = r.get(2);
+        double f[3], l[3], dma[3];
+        for (int i = 0; i < 3; i++) f[i] = sext(r.get(16), 16) / 32768.0;
+        for (int i = 0; i < 3; i++) l[i] = sext(r.get(16), 16) / 32768.0;
+        for (int i = 0; i < 3; i++) dma[i] = sext(r.get(8), 8) * (div4 ? 4 : 1) / 32768.0;
+        double cm[3];
+        for (int i = 0; i < 3; i++) cm[i] = 0.5 * (f[i] + l[i]) + dma[i];
+        rebuild(f, mi, qf); rebuild(cm, mi, qm); rebuild(l, mi, ql);
+    } else {
+        double* qs[3] = {qf, qm, ql};
+        for (int j = 0; j < 3; j++) {
+            int mj = r.get(2);
+            double c[3];
+            for (int i = 0; i < 3; i++) c[i] = sext(r.get(13), 13) / 4096.0;
+            rebuild(c, mj, qs[j]);
+        }
+    }
+    return mode;
+}
+double q_angle_deg(const double a[4], const double b[4]) {
+    double na = sqrt(a[0]*a[0]+a[1]*a[1]+a[2]*a[2]+a[3]*a[3]);
+    double nb = sqrt(b[0]*b[0]+b[1]*b[1]+b[2]*b[2]+b[3]*b[3]);
+    double d = (a[0]*b[0]+a[1]*b[1]+a[2]*b[2]+a[3]*b[3]) / (na * nb);
+    if (d < 0) d = -d;
+    if (d > 1) d = 1;
+    return 2.0 * acos(d) * 180.0 / 3.14159265358979323846;
+}
+// one 5 ms rotation increment of `rate` deg/s about a fixed axis
+void incr(double rate_dps, const double axis[3], double q[4]) {
+    double ang = rate_dps * 0.005 * 3.14159265358979323846 / 180.0;
+    double s = sin(ang / 2);
+    q[0] = axis[0] * s; q[1] = axis[1] * s; q[2] = axis[2] * s; q[3] = cos(ang / 2);
+}
+void qmul(const double a[4], const double b[4], double o[4]) {
+    double x = a[3]*b[0] + a[0]*b[3] + a[1]*b[2] - a[2]*b[1];
+    double y = a[3]*b[1] - a[0]*b[2] + a[1]*b[3] + a[2]*b[0];
+    double z = a[3]*b[2] + a[0]*b[1] - a[1]*b[0] + a[2]*b[3];
+    double w = a[3]*b[3] - a[0]*b[0] - a[1]*b[1] - a[2]*b[2];
+    o[0] = x; o[1] = y; o[2] = z; o[3] = w;
+}
+// build first/mid/last by integrating two 5 ms steps from identity
+void triplet(double r1, double r2, const double axis[3],
+             double qf[4], double qm[4], double ql[4]) {
+    double i1[4], i2[4];
+    incr(r1, axis, i1);
+    incr(r2, axis, i2);
+    qf[0] = qf[1] = qf[2] = 0; qf[3] = 1;   // identity
+    qmul(qf, i1, qm);
+    qmul(qm, i2, ql);
+}
+} // namespace
+
+static void test_quat_pack_mode2_slow(void) {
+    const double axis[3] = {0.3015, -0.9045, 0.3015}; // unit-ish, mixed
+    double qf[4], qm[4], ql[4];
+    triplet(20.0, 20.0, axis, qf, qm, ql); // 20 deg/s: well within mode-2 range
+    uint8_t region[36] = {};
+    pro::pack_quat_motion(region, qf, qm, ql, 1234);
+    double df[4], dm[4], dl[4];
+    int mode = decode_region(region, df, dm, dl);
+    TEST_ASSERT_EQUAL_INT(2, mode);
+    TEST_ASSERT_TRUE(q_angle_deg(qf, df) < 0.005);
+    TEST_ASSERT_TRUE(q_angle_deg(qm, dm) < 0.005);
+    TEST_ASSERT_TRUE(q_angle_deg(ql, dl) < 0.005);
+}
+
+static void test_quat_pack_mode1_fast(void) {
+    const double axis[3] = {0.0, 1.0, 0.0}; // pure yaw
+    double qf[4], qm[4], ql[4];
+    triplet(250.0, 250.0, axis, qf, qm, ql); // 250 deg/s overruns mode-2 deltas
+    uint8_t region[36] = {};
+    pro::pack_quat_motion(region, qf, qm, ql, 0);
+    double df[4], dm[4], dl[4];
+    int mode = decode_region(region, df, dm, dl);
+    TEST_ASSERT_EQUAL_INT(1, mode);
+    TEST_ASSERT_TRUE(q_angle_deg(qf, df) < 0.02);
+    TEST_ASSERT_TRUE(q_angle_deg(qm, dm) < 0.02);
+    TEST_ASSERT_TRUE(q_angle_deg(ql, dl) < 0.02);
+}
+
+static void test_quat_pack_mode0_erratic(void) {
+    const double axis[3] = {0.0, 1.0, 0.0};
+    double qf[4], qm[4], ql[4];
+    // full reversal at 1000 deg/s: mid is an extreme, not the chord midpoint ->
+    // mode 1's delta (even x4) overflows, so the packer must fall back to mode 0.
+    triplet(1000.0, -1000.0, axis, qf, qm, ql);
+    uint8_t region[36] = {};
+    pro::pack_quat_motion(region, qf, qm, ql, 0);
+    double df[4], dm[4], dl[4];
+    int mode = decode_region(region, df, dm, dl);
+    TEST_ASSERT_EQUAL_INT(0, mode);
+    TEST_ASSERT_TRUE(q_angle_deg(qf, df) < 0.1);
+    TEST_ASSERT_TRUE(q_angle_deg(qm, dm) < 0.1);
+    TEST_ASSERT_TRUE(q_angle_deg(ql, dl) < 0.1);
+}
+
+static void test_quat_pack_at_rest(void) {
+    // identity triplet -> mode 2, all components zero (byte-compatible with the
+    // previously hardware-validated at-rest output).
+    double id[4] = {0, 0, 0, 1};
+    uint8_t region[36] = {};
+    pro::pack_quat_motion(region, id, id, id, 0);
+    TEST_ASSERT_EQUAL_INT(2, region[6] & 0x3); // packing_mode field
+    double df[4], dm[4], dl[4];
+    decode_region(region, df, dm, dl);
+    TEST_ASSERT_TRUE(q_angle_deg(id, dl) < 1e-6);
+}
+
 static void test_tick_pacing(void) {
     fresh();
     uint8_t r[pro::REPORT_LEN];
@@ -427,6 +583,10 @@ int main(int, char**) {
     RUN_TEST(test_manual_pairing_subcmd01);
     RUN_TEST(test_report30_golden);
     RUN_TEST(test_report30_imu_samples);
+    RUN_TEST(test_quat_pack_mode2_slow);
+    RUN_TEST(test_quat_pack_mode1_fast);
+    RUN_TEST(test_quat_pack_mode0_erratic);
+    RUN_TEST(test_quat_pack_at_rest);
     RUN_TEST(test_tick_pacing);
     RUN_TEST(test_rumble_neutral);
     RUN_TEST(test_rumble_amp_inversion);

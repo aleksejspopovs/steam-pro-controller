@@ -350,10 +350,6 @@ void Controller::handle_output(const uint8_t* d, size_t len, uint64_t now_us) {
 namespace {
 
 inline void wr16(uint8_t* p, uint16_t v) { p[0] = v & 0xFF; p[1] = v >> 8; }
-inline void wr32(uint8_t* p, uint32_t v) {
-    p[0] = v & 0xFF; p[1] = (v >> 8) & 0xFF;
-    p[2] = (v >> 16) & 0xFF; p[3] = (v >> 24) & 0xFF;
-}
 inline void wr_s16(uint8_t* p, int16_t v) { wr16(p, (uint16_t)v); }
 
 // Advance the orientation quaternion by one IMU sample over `dt` seconds.
@@ -383,43 +379,140 @@ void integrate_orientation(double q[4], const xl::ImuSample& s, double dt) {
     q[0] = rx * inv; q[1] = ry * inv; q[2] = rz * inv; q[3] = rw * inv;
 }
 
-// Write the mode-2 packed quaternion into the 36-byte motion region (out+13).
-// Drops the largest component (rebuildable from ||q||=1), stores the other
-// three as 21-bit fixed point (2^20 == 1.0), all deltas zero (single sample).
-// Inverse of tools/decode_mode2.py; spec in reference/switch_motion_packing.hpp.
-void pack_quat_mode2(uint8_t* region, const double q[4], uint32_t ts_ms) {
+// The packed quaternion triplet is one contiguous LSB-first 144-bit
+// little-endian stream laid into the three 6-byte gaps the accel samples leave
+// at region bytes 6-11 / 18-23 / 30-35. Fields are appended in struct-
+// declaration order (reference/switch_motion_packing.hpp); a field that crosses
+// a 48-bit gap join is exactly the header's _l/_h split. GyroBitWriter builds
+// the 144-bit stream, then scatters it byte-for-byte into the gaps.
+struct GyroBitWriter {
+    uint8_t buf[18] = {}; // 144 bits, LSB-first contiguous
+    int pos = 0;
+    void put(uint32_t v, int width) {
+        for (int k = 0; k < width; k++) {
+            if ((v >> k) & 1u) buf[pos >> 3] |= (uint8_t)(1u << (pos & 7));
+            pos++;
+        }
+    }
+    void emit(uint8_t* region) const {
+        for (int g = 0; g < 3; g++) memcpy(region + 6 + 12 * g, buf + 6 * g, 6);
+    }
+};
+
+// Fixed-point unit-scales: a quaternion component of 1.0 maps to 2^N.
+constexpr double S20 = 1048576.0; // mode 2 absolute (21-bit field)
+constexpr double S15 = 32768.0;   // mode 1 absolute (16-bit field)
+constexpr double S12 = 4096.0;    // mode 0 absolute (13-bit field)
+
+// Representable delta ceilings, in component units, that decide the mode.
+// Past these the field clamps and the reconstruction degrades (see the
+// crossover table in tools/sim_quat_packing.py).
+constexpr double M2_DLF = 4095.0 / S20; // mode 2 first->last delta (13-bit)
+constexpr double M2_DMA = 63.0 / S20;   // mode 2 mid-vs-chord delta (7-bit)
+constexpr double M1_DMA = 508.0 / S15;  // mode 1 mid-vs-chord delta (8-bit, x4)
+
+inline int drop_index(const double q[4]) {
     int mi = 0;
     for (int i = 1; i < 4; i++)
         if (fabs(q[i]) > fabs(q[mi])) mi = i;
-    double sign = q[mi] < 0 ? -1.0 : 1.0; // canonicalise dropped component positive
+    return mi;
+}
 
-    int32_t ls[3];
-    for (int i = 0; i < 3; i++) {
-        int32_t c30 = (int32_t)(q[(mi + i + 1) & 3] * sign * 1073741824.0); // *0x40000000
-        ls[i] = c30 >> 10; // 21-bit signed fixed point
-    }
-    uint32_t u0 = (uint32_t)ls[0] & 0x1FFFFF;
-    uint32_t u1 = (uint32_t)ls[1] & 0x1FFFFF;
-    uint32_t u2 = (uint32_t)ls[2] & 0x1FFFFF;
-
-    // gap 1 (region 6..11): packing_mode | max_index | last_sample_0 | ls1 split
-    uint32_t a = 2u | ((uint32_t)mi << 2) | (u0 << 4) | ((u1 & 0x7F) << 25);
-    uint16_t ah = (uint16_t)(((u1 >> 7) & 0x3FFF) | ((u2 & 0x3) << 14));
-    wr32(region + 6, a);
-    wr16(region + 10, ah);
-
-    // gap 2 (region 18..23): last_sample_2 high 19 bits; delta_last_first_* = 0
-    wr32(region + 18, (u2 >> 2) & 0x7FFFF);
-    wr16(region + 22, 0);
-
-    // gap 3 (region 30..35): delta_mid_avg_* = 0; timestamp; count = 3 samples
-    uint32_t c = (uint32_t)(ts_ms & 0x1) << 31; // timestamp_start_l at bit 31
-    uint16_t ch = (uint16_t)(((ts_ms >> 1) & 0x3FF) | (3u << 10)); // start_h | count
-    wr32(region + 30, c);
-    wr16(region + 34, ch);
+inline int32_t clampq(double x, int32_t lo, int32_t hi) {
+    long v = lrint(x);
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    return (int32_t)v;
 }
 
 } // namespace
+
+// Choose the packing mode adaptively and write the 36-byte motion region.
+// All three modes drop each sample's largest component (rebuildable from
+// ||q||=1) and canonicalise it positive; the difference is how the triplet is
+// represented (see pro.h / tools/sim_quat_packing.py for the precision/range
+// trade-offs). Inverse of the decoders in tools/decode_mode2.py.
+void pack_quat_motion(uint8_t region[36], const double qf[4], const double qm[4],
+                      const double ql[4], uint32_t ts_ms) {
+    // mode 1/2 share one dropped index, taken from the mid sample and sign-
+    // canonicalised so its dropped component is positive (the decoder rebuilds
+    // it as +sqrt(1-||rest||^2)). first/last inherit the same flip; that holds
+    // only while they agree with mid on the dominant axis.
+    int mi = drop_index(qm);
+    double sign = qm[mi] < 0 ? -1.0 : 1.0;
+    double cf[3], cm[3], cl[3];
+    for (int i = 0; i < 3; i++) {
+        cf[i] = qf[(mi + i + 1) & 3] * sign;
+        cm[i] = qm[(mi + i + 1) & 3] * sign;
+        cl[i] = ql[(mi + i + 1) & 3] * sign;
+    }
+    bool shared = (drop_index(qf) == mi) && (drop_index(ql) == mi);
+
+    double dlf_max = 0.0, dma_max = 0.0;
+    for (int i = 0; i < 3; i++) {
+        double avg = 0.5 * (cf[i] + cl[i]);
+        dlf_max = fmax(dlf_max, fabs(cl[i] - cf[i]));
+        dma_max = fmax(dma_max, fabs(cm[i] - avg));
+    }
+
+    GyroBitWriter w;
+    if (shared && dlf_max <= M2_DLF && dma_max <= M2_DMA) {
+        // mode 2: last absolute @21-bit, first via 13-bit delta, mid via 7-bit
+        // delta-from-chord. Best absolute precision; slow/steady motion only.
+        w.put(2, 2);
+        w.put((uint32_t)mi, 2);
+        for (int i = 0; i < 3; i++)
+            w.put((uint32_t)clampq(cl[i] * S20, -(1 << 20), (1 << 20) - 1), 21);
+        for (int i = 0; i < 3; i++)
+            w.put((uint32_t)clampq((cl[i] - cf[i]) * S20, -(1 << 12), (1 << 12) - 1), 13);
+        for (int i = 0; i < 3; i++) {
+            double avg = 0.5 * (cf[i] + cl[i]);
+            w.put((uint32_t)clampq((cm[i] - avg) * S20, -(1 << 6), (1 << 6) - 1), 7);
+        }
+        w.put(ts_ms & 0x7FF, 11);
+        w.put(3, 6);
+    } else if (shared && dma_max <= M1_DMA) {
+        // mode 1: first & last absolute @16-bit, mid via 8-bit delta-from-chord
+        // (x4 when div4 set). Endpoints unbounded -> fast but smooth motion.
+        double dev[3], devmax = 0.0;
+        for (int i = 0; i < 3; i++) {
+            double avg = 0.5 * (cf[i] + cl[i]);
+            dev[i] = (cm[i] - avg) * S15;
+            devmax = fmax(devmax, fabs(dev[i]));
+        }
+        int div4 = devmax > 127.0 ? 1 : 0;
+        double dscale = div4 ? 4.0 : 1.0;
+        w.put(1, 2);
+        w.put((uint32_t)div4, 1);
+        w.put((uint32_t)mi, 2);
+        for (int i = 0; i < 3; i++)
+            w.put((uint32_t)clampq(cf[i] * S15, -(1 << 15), (1 << 15) - 1), 16);
+        for (int i = 0; i < 3; i++)
+            w.put((uint32_t)clampq(cl[i] * S15, -(1 << 15), (1 << 15) - 1), 16);
+        for (int i = 0; i < 3; i++)
+            w.put((uint32_t)clampq(dev[i] / dscale, -(1 << 7), (1 << 7) - 1), 8);
+        w.put(ts_ms & 0x7FF, 11);
+        w.put(3, 6);
+    } else {
+        // mode 0: three independent 13-bit quaternions, each its own dropped
+        // index. Lowest precision but survives erratic motion (reversals/shake)
+        // where the shared-index/chord assumptions of modes 1/2 break.
+        w.put(0, 2);
+        const double* qq[3] = {qf, qm, ql};
+        for (int j = 0; j < 3; j++) {
+            int mj = drop_index(qq[j]);
+            double sgn = qq[j][mj] < 0 ? -1.0 : 1.0;
+            w.put((uint32_t)mj, 2);
+            for (int i = 0; i < 3; i++) {
+                double c = qq[j][(mj + i + 1) & 3] * sgn;
+                w.put((uint32_t)clampq(c * S12, -(1 << 12), (1 << 12) - 1), 13);
+            }
+        }
+        w.put(ts_ms & 0x7FF, 11);
+        w.put(3, 6);
+    }
+    w.emit(region);
+}
 
 void Controller::build_report30(uint8_t out[REPORT_LEN], uint64_t now_us) {
     memset(out, 0, REPORT_LEN);
@@ -430,18 +523,22 @@ void Controller::build_report30(uint8_t out[REPORT_LEN], uint64_t now_us) {
         xl::ImuSample s[3];
         imu_.sample3(now_us, s);
         if (imu_quaternion_) {
-            // Mode 2: integrate the 3 sub-samples (5 ms grid) into the running
-            // orientation; accel stays plain int16 in its 3 slots, the gyro
-            // bytes carry the packed quaternion (last sample only, deltas 0).
+            // Quaternion mode: integrate the 3 sub-samples (5 ms grid) into the
+            // running orientation, capturing it at each step as the first/mid/
+            // last samples. accel stays plain int16 in its 3 slots; the gyro
+            // bytes carry the adaptively-packed quaternion triplet.
             constexpr double DT = (double)REPORT_PERIOD_US / 3.0 / 1e6;
+            double q3[3][4];
             for (int i = 0; i < 3; i++) {
                 integrate_orientation(orient_, s[i], DT);
+                memcpy(q3[i], orient_, sizeof(orient_));
                 uint8_t* a = out + 13 + 12 * i;
                 wr_s16(a + 0, s[i].ax);
                 wr_s16(a + 2, s[i].ay);
                 wr_s16(a + 4, s[i].az);
             }
-            pack_quat_mode2(out + 13, orient_, (uint32_t)(now_us / 1000));
+            pack_quat_motion(out + 13, q3[0], q3[1], q3[2],
+                             (uint32_t)(now_us / 1000));
         } else {
             for (int i = 0; i < 3; i++) {
                 uint8_t* p = out + 13 + 12 * i;
