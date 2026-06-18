@@ -2,5 +2,3 @@
 - Add defensive logging to detect unimplemented functionality (IMU mode 3? IMU sensitivity adjustment?)
 - Add rebinding capabilities (read from SD?) and utilize the extra buttons
 - Use the Steam Controller's own quaternion output instead of integrating the gyro
-- Investigate the BT pairing handshake at the beginning of the Switch protocol, document, see if we can make it faster
-- Disable IMU on Steam Controller when it is not enabled by Switch for power saving (?)
