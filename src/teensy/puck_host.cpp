@@ -101,9 +101,10 @@ int g_init_attempts = 0;
 volatile int g_imu_changes = 0;
 uint8_t g_last_imu[12] = {}; // accel(34..39)+gyro(40..45); NOT the ts counter
 
-// rumble (device -> host)
-uint8_t g_rumble_grip[10] = {0x80};
-volatile bool g_rumble_active = false;
+// rumble (device -> host): four 0x83 tones -- L grip, R grip, L pad, R pad
+uint8_t g_tones[4][10] = {{0x83}, {0x83}, {0x83}, {0x83}};
+volatile bool g_tone_active[4] = {false, false, false, false};
+volatile bool g_rumble_active = false; // any tone active
 volatile bool g_rumble_dirty = false;
 uint32_t g_rumble_resend_ms = 0;
 
@@ -458,15 +459,22 @@ void task(uint32_t now_ms) {
         crashlog::flush("0x45 imu batch logged");
     }
 
-    // rumble back-path: forward on change, resend <=40 ms while active
+    // rumble back-path: forward on change, resend <=40 ms while active. Each
+    // active actuator is its own 0x83 output report; silent ones aren't sent
+    // and expire by their tone duration. NOTE: this fires up to four
+    // sendPacket() calls per pass -- confirm the host driver queues them
+    // cleanly (vs. dropping/overwriting in-flight) during hardware bring-up.
     if (g_active >= 0 && (g_rumble_dirty ||
                           (g_rumble_active && now_ms >= g_rumble_resend_ms))) {
         g_rumble_dirty = false;
         if (g_slots[g_active].drv) {
-            static uint8_t out[FEATURE_LEN] __attribute__((aligned(32)));
-            memset(out, 0, sizeof(out));
-            memcpy(out, g_rumble_grip, sizeof(g_rumble_grip));
-            g_slots[g_active].drv->sendPacket(out, FEATURE_LEN);
+            for (int a = 0; a < 4; a++) {
+                if (!g_tone_active[a]) continue;
+                static uint8_t out[FEATURE_LEN] __attribute__((aligned(32)));
+                memset(out, 0, sizeof(out));
+                memcpy(out, g_tones[a], sizeof(g_tones[a]));
+                g_slots[g_active].drv->sendPacket(out, FEATURE_LEN);
+            }
         }
         g_rumble_resend_ms = now_ms + 40;
     }
@@ -494,9 +502,14 @@ bool pop_imu(xl::ImuSample& s, uint64_t& t_us) {
     return true;
 }
 
-void set_rumble(const uint8_t grip[10], bool active) {
-    memcpy(g_rumble_grip, grip, 10);
-    g_rumble_active = active;
+void set_tones(const uint8_t tones[4][10], const bool active[4]) {
+    bool any = false;
+    for (int a = 0; a < 4; a++) {
+        memcpy(g_tones[a], tones[a], 10);
+        g_tone_active[a] = active[a];
+        any |= active[a];
+    }
+    g_rumble_active = any;
     g_rumble_dirty = true;
 }
 
