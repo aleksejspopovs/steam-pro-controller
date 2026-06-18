@@ -53,7 +53,8 @@ int8_t amp_to_db(uint16_t amp);
 //   left  low band  -> left  GRIP (side 3)    right low band  -> right GRIP (side 4)
 //   left  high band -> left  PAD  (side 0)    right high band -> right PAD  (side 1)
 //
-// gain comes from the band amplitude; MASTER_GAIN_DB trims overall loudness.
+// gain comes from the band amplitude plus a per-band trim (GRIP_GAIN_DB for the
+// low band on the grips, PAD_GAIN_DB for the high band on the pads).
 // side 5 (both grips at once) is avoided -- same-frequency beating.
 
 constexpr uint8_t N_TONE = 4; // four actuators driven independently
@@ -66,10 +67,12 @@ constexpr size_t TONE_LEN = 10; // 0x83 report incl. id
 // 0x83 tone duration; outlives the 40 ms resend cadence, dies fast on stop.
 constexpr uint16_t TONE_DURATION_MS = 100;
 
-// Tuning. MASTER_GAIN_DB trims overall loudness on top of the per-tone
-// amp_to_db (which is <= 0 dB, 0 at full amp). Freq clamp keeps us in the
-// codec's range and off the very low end where grips get drummy.
-constexpr int8_t MASTER_GAIN_DB = 0;     // overall loudness trim (TUNE on hw)
+// Tuning. Each band adds a trim (dB) on top of the per-tone amp_to_db (which is
+// <= 0 dB, 0 at full amp); grips and pads differ in output, so they trim
+// independently. Freq clamp keeps us in the codec's range and off the very low
+// end where grips get drummy. Calibrate with tools/rumble_calibrate.py.
+constexpr int8_t GRIP_GAIN_DB = 0;       // low band -> grips trim (TUNE on hw)
+constexpr int8_t PAD_GAIN_DB = 0;        // high band -> pads trim (TUNE on hw)
 constexpr int8_t GAIN_MAX_DB = 6;        // clip ceiling (SDL allows positive)
 constexpr int8_t GAIN_MIN_DB = -40;      // inaudible floor
 constexpr uint16_t FREQ_MIN_HZ = 40;     // codec low-band floor
@@ -81,8 +84,9 @@ struct TonePacket {
 };
 
 // Build one actuator's 0x83 tone from a band's (freq, amp). side = 0x83 `side`
-// selector. amp 0 or freq 0 -> inactive (no tone).
-TonePacket to_tone(uint8_t side, uint16_t freq_hz, uint16_t amp);
+// selector; trim_db adds to the amplitude-derived gain (GRIP_GAIN_DB/PAD_GAIN_DB).
+// amp 0 or freq 0 -> inactive (no tone).
+TonePacket to_tone(uint8_t side, uint16_t freq_hz, uint16_t amp, int8_t trim_db);
 
 // Decodes a full 8-byte Switch rumble payload and tracks the four output tones.
 class State {

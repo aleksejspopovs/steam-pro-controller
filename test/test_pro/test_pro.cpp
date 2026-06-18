@@ -534,19 +534,18 @@ static void test_rumble_amp_to_db(void) {
 
 static void test_rumble_to_tone(void) {
     // amp 0 or freq 0 -> inactive (no tone), but side byte is still set
-    rumble::TonePacket off = rumble::to_tone(3, 160, 0);
+    rumble::TonePacket off = rumble::to_tone(3, 160, 0, 0);
     TEST_ASSERT_FALSE(off.active);
     TEST_ASSERT_EQUAL_HEX8(0x83, off.bytes[0]);
     TEST_ASSERT_EQUAL_HEX8(3, off.bytes[1]);
-    TEST_ASSERT_FALSE(rumble::to_tone(3, 0, 1003).active); // freq 0 -> inactive
+    TEST_ASSERT_FALSE(rumble::to_tone(3, 0, 1003, 0).active); // freq 0 -> inactive
 
     // active tone -> 0x83 [side, gain_db, freq, dur, lfo=0, depth=0]
-    rumble::TonePacket t = rumble::to_tone(1, 320, 503);
+    rumble::TonePacket t = rumble::to_tone(1, 320, 503, 0);
     TEST_ASSERT_TRUE(t.active);
     TEST_ASSERT_EQUAL_HEX8(0x83, t.bytes[0]);
     TEST_ASSERT_EQUAL_HEX8(1, t.bytes[1]); // right pad
-    TEST_ASSERT_EQUAL_INT8((int8_t)(rumble::amp_to_db(503) + rumble::MASTER_GAIN_DB),
-                           (int8_t)t.bytes[2]);
+    TEST_ASSERT_EQUAL_INT8(rumble::amp_to_db(503), (int8_t)t.bytes[2]);
     TEST_ASSERT_EQUAL_UINT16(320, (uint16_t)(t.bytes[3] | (t.bytes[4] << 8)));
     TEST_ASSERT_EQUAL_UINT16(rumble::TONE_DURATION_MS,
                              (uint16_t)(t.bytes[5] | (t.bytes[6] << 8)));
@@ -554,10 +553,19 @@ static void test_rumble_to_tone(void) {
     TEST_ASSERT_EQUAL_HEX8(0, t.bytes[8]); // lfo_freq hi
     TEST_ASSERT_EQUAL_HEX8(0, t.bytes[9]); // lfo_depth
 
+    // trim_db adds to the amplitude-derived gain
+    TEST_ASSERT_EQUAL_INT8((int8_t)(rumble::amp_to_db(503) - 6),
+                           (int8_t)rumble::to_tone(1, 320, 503, -6).bytes[2]);
+    // trim clamps to the ceiling/floor
+    TEST_ASSERT_EQUAL_INT8(rumble::GAIN_MAX_DB,
+                           (int8_t)rumble::to_tone(3, 160, 1003, 100).bytes[2]);
+    TEST_ASSERT_EQUAL_INT8(rumble::GAIN_MIN_DB,
+                           (int8_t)rumble::to_tone(3, 160, 1, -100).bytes[2]);
+
     // gain tracks amplitude (louder amp -> higher dB), monotonic
     int8_t last = -128;
     for (uint16_t a = 1; a <= 1003; a += 100) {
-        rumble::TonePacket x = rumble::to_tone(3, 160, a);
+        rumble::TonePacket x = rumble::to_tone(3, 160, a, 0);
         TEST_ASSERT_TRUE(x.active);
         TEST_ASSERT_GREATER_OR_EQUAL_INT8(last, (int8_t)x.bytes[2]);
         last = (int8_t)x.bytes[2];
@@ -565,11 +573,11 @@ static void test_rumble_to_tone(void) {
 
     // frequency is clamped into the codec range
     TEST_ASSERT_EQUAL_UINT16(rumble::FREQ_MIN_HZ,
-        (uint16_t)(rumble::to_tone(3, 1, 1003).bytes[3] |
-                   (rumble::to_tone(3, 1, 1003).bytes[4] << 8)));
+        (uint16_t)(rumble::to_tone(3, 1, 1003, 0).bytes[3] |
+                   (rumble::to_tone(3, 1, 1003, 0).bytes[4] << 8)));
     TEST_ASSERT_EQUAL_UINT16(rumble::FREQ_MAX_HZ,
-        (uint16_t)(rumble::to_tone(0, 5000, 1003).bytes[3] |
-                   (rumble::to_tone(0, 5000, 1003).bytes[4] << 8)));
+        (uint16_t)(rumble::to_tone(0, 5000, 1003, 0).bytes[3] |
+                   (rumble::to_tone(0, 5000, 1003, 0).bytes[4] << 8)));
 }
 
 static void test_rumble_state_via_output_reports(void) {

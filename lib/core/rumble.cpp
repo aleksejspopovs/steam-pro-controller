@@ -163,16 +163,16 @@ int8_t amp_to_db(uint16_t amp) {
     return -40;
 }
 
-TonePacket to_tone(uint8_t side, uint16_t freq_hz, uint16_t amp) {
+TonePacket to_tone(uint8_t side, uint16_t freq_hz, uint16_t amp, int8_t trim_db) {
     TonePacket p;
     p.bytes[1] = side;
     if (amp == 0 || freq_hz == 0)
         return p; // inactive; a playing tone expires by its duration
 
     // MsgHapticLfoTone: [0x83, side, gain_db, freq, duration_ms, lfo, depth].
-    // gain = band amplitude (dB, <=0) + master trim; lfo off (we stream gain).
+    // gain = band amplitude (dB, <=0) + per-band trim; lfo off (we stream gain).
     p.active = true;
-    int g = (int)amp_to_db(amp) + (int)MASTER_GAIN_DB;
+    int g = (int)amp_to_db(amp) + (int)trim_db;
     if (g > (int)GAIN_MAX_DB) g = (int)GAIN_MAX_DB;
     if (g < (int)GAIN_MIN_DB) g = (int)GAIN_MIN_DB;
     p.bytes[2] = (uint8_t)(int8_t)g;
@@ -189,10 +189,10 @@ bool State::update(const uint8_t data[8]) {
     r_ = rdec_.decode(data + 4);
     // low bands -> grips (side 3/4), high bands -> pads (side 0/1)
     const TonePacket next[N_TONE] = {
-        to_tone(3, l_.lf_hz, l_.lf_amp), // ACT_L_GRIP
-        to_tone(4, r_.lf_hz, r_.lf_amp), // ACT_R_GRIP
-        to_tone(0, l_.hf_hz, l_.hf_amp), // ACT_L_PAD
-        to_tone(1, r_.hf_hz, r_.hf_amp), // ACT_R_PAD
+        to_tone(3, l_.lf_hz, l_.lf_amp, GRIP_GAIN_DB), // ACT_L_GRIP
+        to_tone(4, r_.lf_hz, r_.lf_amp, GRIP_GAIN_DB), // ACT_R_GRIP
+        to_tone(0, l_.hf_hz, l_.hf_amp, PAD_GAIN_DB),  // ACT_L_PAD
+        to_tone(1, r_.hf_hz, r_.hf_amp, PAD_GAIN_DB),  // ACT_R_PAD
     };
     bool changed = false;
     for (size_t a = 0; a < N_TONE && !changed; a++) {
