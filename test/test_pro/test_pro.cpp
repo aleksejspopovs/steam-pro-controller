@@ -580,6 +580,32 @@ static void test_rumble_to_tone(void) {
                    (rumble::to_tone(0, 5000, 1003, 0).bytes[4] << 8)));
 }
 
+static void test_rumble_corr_db(void) {
+    // empty / null table -> no correction
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, rumble::corr_db(nullptr, 0, 200));
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, rumble::corr_db(rumble::GRIP_CORR, 0, 200)); // n=0
+
+    // exact table points are returned as-is
+    const rumble::CorrPoint* g = rumble::GRIP_CORR;
+    size_t n = rumble::GRIP_CORR_N;
+    TEST_ASSERT_EQUAL_FLOAT(g[0].db, rumble::corr_db(g, n, g[0].hz));
+    TEST_ASSERT_EQUAL_FLOAT(g[5].db, rumble::corr_db(g, n, g[5].hz));
+
+    // held flat past either end
+    TEST_ASSERT_EQUAL_FLOAT(g[0].db, rumble::corr_db(g, n, 1));
+    TEST_ASSERT_EQUAL_FLOAT(g[n - 1].db, rumble::corr_db(g, n, 5000));
+
+    // interpolated point sits between its neighbours (171->193 Hz, both +12)
+    float mid = rumble::corr_db(g, n, 182);
+    TEST_ASSERT_FLOAT_WITHIN(0.1f, 12.0f, mid);
+
+    // and to_tone folds the EQ into the gain: same (side,freq,amp,trim) with the
+    // grip table differs from flat by lroundf(corr_db) at that frequency.
+    int8_t flat = (int8_t)rumble::to_tone(3, 105, 503, 0).bytes[2];
+    int8_t eq = (int8_t)rumble::to_tone(3, 105, 503, 0, g, n).bytes[2];
+    TEST_ASSERT_EQUAL_INT8((int8_t)(flat + lroundf(rumble::corr_db(g, n, 105))), eq);
+}
+
 static void test_rumble_state_via_output_reports(void) {
     fresh();
     // rumble-only output report 0x10 with a strong left effect
@@ -634,6 +660,7 @@ int main(int, char**) {
     RUN_TEST(test_rumble_differential_stateful);
     RUN_TEST(test_rumble_amp_to_db);
     RUN_TEST(test_rumble_to_tone);
+    RUN_TEST(test_rumble_corr_db);
     RUN_TEST(test_rumble_state_via_output_reports);
     return UNITY_END();
 }

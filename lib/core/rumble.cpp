@@ -163,22 +163,37 @@ int8_t amp_to_db(uint16_t amp) {
     return -40;
 }
 
-TonePacket to_tone(uint8_t side, uint16_t freq_hz, uint16_t amp, int8_t trim_db) {
+float corr_db(const CorrPoint* tbl, size_t n, uint16_t hz) {
+    if (!tbl || n == 0) return 0.0f;
+    if (hz <= tbl[0].hz) return tbl[0].db;            // hold flat past the ends
+    if (hz >= tbl[n - 1].hz) return tbl[n - 1].db;
+    for (size_t i = 1; i < n; i++) {
+        if (hz <= tbl[i].hz) {                        // interpolate in log-freq
+            float l0 = logf((float)tbl[i - 1].hz), l1 = logf((float)tbl[i].hz);
+            float u = (logf((float)hz) - l0) / (l1 - l0);
+            return tbl[i - 1].db + u * (tbl[i].db - tbl[i - 1].db);
+        }
+    }
+    return tbl[n - 1].db;
+}
+
+TonePacket to_tone(uint8_t side, uint16_t freq_hz, uint16_t amp, int8_t trim_db,
+                   const CorrPoint* corr, size_t corr_n) {
     TonePacket p;
     p.bytes[1] = side;
     if (amp == 0 || freq_hz == 0)
         return p; // inactive; a playing tone expires by its duration
 
     // MsgHapticLfoTone: [0x83, side, gain_db, freq, duration_ms, lfo, depth].
-    // gain = band amplitude (dB, <=0) + per-band trim; lfo off (we stream gain).
     p.active = true;
-    int g = (int)amp_to_db(amp) + (int)trim_db;
+    uint16_t f = freq_hz;                             // clamp first; EQ uses the
+    if (f < FREQ_MIN_HZ) f = FREQ_MIN_HZ;             // frequency we actually emit
+    if (f > FREQ_MAX_HZ) f = FREQ_MAX_HZ;
+    // gain = band amplitude (dB, <=0) + loudness trim + freq-response EQ; lfo off.
+    int g = (int)amp_to_db(amp) + (int)trim_db + (int)lroundf(corr_db(corr, corr_n, f));
     if (g > (int)GAIN_MAX_DB) g = (int)GAIN_MAX_DB;
     if (g < (int)GAIN_MIN_DB) g = (int)GAIN_MIN_DB;
     p.bytes[2] = (uint8_t)(int8_t)g;
-    uint16_t f = freq_hz;
-    if (f < FREQ_MIN_HZ) f = FREQ_MIN_HZ;
-    if (f > FREQ_MAX_HZ) f = FREQ_MAX_HZ;
     wr_u16(p.bytes + 3, f);
     wr_u16(p.bytes + 5, TONE_DURATION_MS);
     return p;
@@ -189,10 +204,10 @@ bool State::update(const uint8_t data[8]) {
     r_ = rdec_.decode(data + 4);
     // low bands -> grips (side 3/4), high bands -> pads (side 0/1)
     const TonePacket next[N_TONE] = {
-        to_tone(3, l_.lf_hz, l_.lf_amp, GRIP_GAIN_DB), // ACT_L_GRIP
-        to_tone(4, r_.lf_hz, r_.lf_amp, GRIP_GAIN_DB), // ACT_R_GRIP
-        to_tone(0, l_.hf_hz, l_.hf_amp, PAD_GAIN_DB),  // ACT_L_PAD
-        to_tone(1, r_.hf_hz, r_.hf_amp, PAD_GAIN_DB),  // ACT_R_PAD
+        to_tone(3, l_.lf_hz, l_.lf_amp, GRIP_GAIN_DB, GRIP_CORR, GRIP_CORR_N), // ACT_L_GRIP
+        to_tone(4, r_.lf_hz, r_.lf_amp, GRIP_GAIN_DB, GRIP_CORR, GRIP_CORR_N), // ACT_R_GRIP
+        to_tone(0, l_.hf_hz, l_.hf_amp, PAD_GAIN_DB, PAD_CORR, PAD_CORR_N),    // ACT_L_PAD
+        to_tone(1, r_.hf_hz, r_.hf_amp, PAD_GAIN_DB, PAD_CORR, PAD_CORR_N),    // ACT_R_PAD
     };
     bool changed = false;
     for (size_t a = 0; a < N_TONE && !changed; a++) {
