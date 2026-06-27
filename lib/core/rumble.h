@@ -71,8 +71,8 @@ constexpr uint16_t TONE_DURATION_MS = 100;
 // <= 0 dB, 0 at full amp); grips and pads differ in output, so they trim
 // independently. Freq clamp keeps us in the codec's range and off the very low
 // end where grips get drummy. Calibrate with tools/rumble_calibrate.py.
-constexpr int8_t GRIP_GAIN_DB = 0;       // low band -> grips trim (TUNE on hw)
-constexpr int8_t PAD_GAIN_DB = 0;        // high band -> pads trim (TUNE on hw)
+constexpr int8_t GRIP_GAIN_DB = -3;      // low band -> grips trim (TUNE on hw)
+constexpr int8_t PAD_GAIN_DB = 4;        // high band -> pads trim (TUNE on hw)
 constexpr int8_t GAIN_MAX_DB = 6;        // clip ceiling (SDL allows positive)
 constexpr int8_t GAIN_MIN_DB = -40;      // inaudible floor
 constexpr uint16_t FREQ_MIN_HZ = 40;     // codec low-band floor
