@@ -4,7 +4,7 @@ _The contents of this repo are not authored by, endorsed by, or in any way affil
 
 This is a hardware adapter that allows a Steam Controller (2026, codename Triton) to be used with a Nintendo Switch, by emulating a wired Switch Pro Controller.
 
-It supports accel/gyro and HD rumble.
+It supports accel/gyro. It supports HD rumble, though it could use further tuning to recreate the real Pro Controller's frequency response more faithfully.
 
 It does not currently make any use of the capacitive touch pads, grips, and sticks. It cannot emulate the GL/GR buttons or the C button, because it emulates the orginal Pro Controller, not the Switch 2 Pro Controller. Likewise, it cannot emulate the Switch 2 Joy-Con mouse functionality.
 
