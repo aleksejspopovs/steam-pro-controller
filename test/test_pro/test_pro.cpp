@@ -407,9 +407,32 @@ static void test_tick_pacing(void) {
     TEST_ASSERT_FALSE(C->tick(NOW + 16000, r));
 }
 
-// ---- HD rumble decode: exact inversion of the encode tables ----
+// ---- HD rumble decode: real Switch AM/FM codec (rumble.cpp) ----
+//
+// Test packets are built independently of the decoder's own bit offsets to
+// keep them an honest check. Two absolute (7-bit) forms cover us:
+//   one7bit  = packet_type 1, reserved[0:2]=0, [0:20]!=0; fields:
+//              fm_hi[2:9] am_hi[9:16] fm_lo[16:23] am_lo[23:30]
+//   one5bit  = packet_type 1, reserved[0:20]=0; fields: hi[20:25] lo[25:30]
+// 7-bit codes: fm 64 = band center (x1.0); am 127 = full (0 dB), am 0 = off.
+
+static void put32le(uint8_t d[4], uint32_t v) {
+    d[0] = v & 0xFF; d[1] = (v >> 8) & 0xFF;
+    d[2] = (v >> 16) & 0xFF; d[3] = (v >> 24) & 0xFF;
+}
+static void one7bit(uint8_t d[4], uint8_t fm_lo, uint8_t am_lo,
+                    uint8_t fm_hi, uint8_t am_hi) {
+    put32le(d, ((uint32_t)fm_hi << 2) | ((uint32_t)am_hi << 9) |
+                  ((uint32_t)fm_lo << 16) | ((uint32_t)am_lo << 23) |
+                  (1u << 30));
+}
+static void one5bit(uint8_t d[4], uint8_t code_lo, uint8_t code_hi) {
+    put32le(d, ((uint32_t)code_hi << 20) | ((uint32_t)code_lo << 25) |
+                  (1u << 30));
+}
 
 static void test_rumble_neutral(void) {
+    // the idle {00 01 40 40} is itself a one7bit packet: centers, zero amp
     const uint8_t neutral[4] = {0x00, 0x01, 0x40, 0x40};
     rumble::Decoded d = rumble::decode_side(neutral);
     TEST_ASSERT_EQUAL_UINT16(0, d.hf_amp);
@@ -418,143 +441,179 @@ static void test_rumble_neutral(void) {
     TEST_ASSERT_EQUAL_UINT16(320, d.hf_hz);
 }
 
-static void test_rumble_amp_inversion(void) {
-    // every amplitude the encoder can emit must decode back exactly,
-    // independently on both bands (the encoder writes them equal)
-    static const uint16_t AMPS[] = {0,  10,  14,  33,  80,  112, 140, 198,
-                                    251, 305, 362, 440, 524, 636, 757, 900,
-                                    981, 1003};
-    for (uint16_t a : AMPS) {
-        uint8_t d[4];
-        rumble::encode_side(d, 320, 160, a);
-        rumble::Decoded out = rumble::decode_side(d);
-        TEST_ASSERT_EQUAL_UINT16(a, out.hf_amp);
-        TEST_ASSERT_EQUAL_UINT16(a, out.lf_amp);
-        TEST_ASSERT_EQUAL_UINT16(160, out.lf_hz);
-        TEST_ASSERT_EQUAL_UINT16(320, out.hf_hz);
+static void test_rumble_amp_levels(void) {
+    uint8_t d[4];
+    // off and full at both ends of the 7-bit amplitude range
+    one7bit(d, 64, 0, 64, 0);
+    rumble::Decoded off = rumble::decode_side(d);
+    TEST_ASSERT_EQUAL_UINT16(0, off.lf_amp);
+    TEST_ASSERT_EQUAL_UINT16(0, off.hf_amp);
+    one7bit(d, 64, 127, 64, 127);
+    rumble::Decoded full = rumble::decode_side(d);
+    TEST_ASSERT_EQUAL_UINT16(rumble::MAX_AMP, full.lf_amp);
+    TEST_ASSERT_EQUAL_UINT16(rumble::MAX_AMP, full.hf_amp);
+    TEST_ASSERT_EQUAL_UINT16(160, full.lf_hz); // amplitude doesn't move freq
+    TEST_ASSERT_EQUAL_UINT16(320, full.hf_hz);
+    // monotonic non-decreasing amplitude across the code range
+    uint16_t last = 0;
+    for (uint8_t code = 0; code <= 127; code += 8) {
+        one7bit(d, 64, code, 64, code);
+        uint16_t a = rumble::decode_side(d).lf_amp;
+        TEST_ASSERT_GREATER_OR_EQUAL_UINT16(last, a);
+        last = a;
     }
 }
 
 static void test_rumble_band_amps_independent(void) {
-    // splice the HB nibble of a strong encode into a weak one: bands differ
-    uint8_t strong[4], weak[4], mixed[4];
-    rumble::encode_side(strong, 320, 160, 1003);
-    rumble::encode_side(weak, 320, 160, 0);
-    mixed[0] = strong[0]; // HB freq high
-    mixed[1] = strong[1]; // HB amp + freq lsb from the strong side
-    mixed[2] = weak[2];   // LB freq + amp lsb from the weak side
-    mixed[3] = weak[3];   // LB amp
-    rumble::Decoded out = rumble::decode_side(mixed);
-    TEST_ASSERT_EQUAL_UINT16(1003, out.hf_amp);
+    // low band off, high band full -> bands decode independently
+    uint8_t d[4];
+    one7bit(d, 64, 0, 64, 127);
+    rumble::Decoded out = rumble::decode_side(d);
+    TEST_ASSERT_EQUAL_UINT16(rumble::MAX_AMP, out.hf_amp);
     TEST_ASSERT_EQUAL_UINT16(0, out.lf_amp);
 }
 
-static void test_rumble_freq_inversion(void) {
-    // low band is invertible across its table span (41..626 Hz)
-    static const uint16_t LFS[] = {41, 50, 80, 102, 160, 261, 320, 626};
-    for (uint16_t f : LFS) {
-        uint8_t d[4];
-        rumble::encode_side(d, 320, f, 100);
-        uint16_t want = (f == 261) ? 263 : f; // 261 not in table -> next row
-        TEST_ASSERT_EQUAL_UINT16(want, rumble::decode_side(d).lf_hz);
-    }
-    // high band likewise (82..1253 Hz)
-    static const uint16_t HFS[] = {82, 160, 320, 640, 1253};
-    for (uint16_t f : HFS) {
-        uint8_t d[4];
-        rumble::encode_side(d, f, 160, 100);
-        TEST_ASSERT_EQUAL_UINT16(f, rumble::decode_side(d).hf_hz);
-    }
-}
-
-static void test_rumble_to_sc(void) {
-    rumble::Decoded off{};
-    rumble::Decoded weak{};
-    weak.lf_amp = 100; weak.lf_hz = 160;
-    rumble::Decoded strong{};
-    strong.lf_amp = 1003; strong.lf_hz = 160;
-
-    // both off -> all-zero stop packet
-    rumble::ScPacket p = rumble::to_sc(off, off);
-    TEST_ASSERT_FALSE(p.active);
-    for (size_t i = 1; i < rumble::SC_PACKET_LEN; i++)
-        TEST_ASSERT_EQUAL_HEX8(0x00, p.bytes[i]);
-
-    // weak left only: left_speed (bytes 4:6) on, right_speed (7:9) clear;
-    // amplitude rides in left_gain (byte 6), right_gain (byte 9) stays 0.
-    p = rumble::to_sc(weak, off);
-    TEST_ASSERT_TRUE(p.active);
-    TEST_ASSERT_EQUAL_UINT16(rumble::GRIP_SPEED,
-                             (uint16_t)(p.bytes[4] | (p.bytes[5] << 8)));
-    TEST_ASSERT_EQUAL_UINT16(0, (uint16_t)(p.bytes[7] | (p.bytes[8] << 8)));
-    TEST_ASSERT_EQUAL_INT8(rumble::grip_gain(100), (int8_t)p.bytes[6]);
-    TEST_ASSERT_EQUAL_HEX8(0x00, p.bytes[9]);
-
-    // strong both: both speeds on, both gains at the peak cap (full amp -> PEAK)
-    p = rumble::to_sc(strong, strong);
-    TEST_ASSERT_EQUAL_UINT16(rumble::GRIP_SPEED,
-                             (uint16_t)(p.bytes[4] | (p.bytes[5] << 8)));
-    TEST_ASSERT_EQUAL_UINT16(rumble::GRIP_SPEED,
-                             (uint16_t)(p.bytes[7] | (p.bytes[8] << 8)));
-    TEST_ASSERT_EQUAL_INT8(rumble::PEAK_GRIP_GAIN_DB, (int8_t)p.bytes[6]);
-    TEST_ASSERT_EQUAL_INT8(rumble::PEAK_GRIP_GAIN_DB, (int8_t)p.bytes[9]);
-
-    // type + intensity fields (bytes 1:4) stay zero like SDL sends them
-    TEST_ASSERT_EQUAL_HEX8(0x00, p.bytes[1]);
-    TEST_ASSERT_EQUAL_HEX8(0x00, p.bytes[2]);
-    TEST_ASSERT_EQUAL_HEX8(0x00, p.bytes[3]);
-
-    // gain carries the envelope: never above PEAK, monotonic up with amp, and
-    // a weaker amp is strictly quieter than full.
-    TEST_ASSERT_LESS_THAN_INT8(rumble::PEAK_GRIP_GAIN_DB + 1, rumble::grip_gain(100));
-    TEST_ASSERT_LESS_THAN_INT8(rumble::grip_gain(1003), rumble::grip_gain(100));
-    int8_t last = -128;
-    for (uint16_t a = 1; a <= 1003; a += 100) {
-        rumble::Decoded x{};
-        x.lf_amp = a; x.lf_hz = 160;
-        p = rumble::to_sc(x, off);
-        TEST_ASSERT_NOT_EQUAL(0, p.bytes[4] | (p.bytes[5] << 8)); // motor on
-        int8_t g = (int8_t)p.bytes[6];
-        TEST_ASSERT_GREATER_OR_EQUAL_INT8(last, g);
-        last = g;
+static void test_rumble_freq_levels(void) {
+    uint8_t d[4];
+    // center
+    one7bit(d, 64, 127, 64, 127);
+    TEST_ASSERT_EQUAL_UINT16(160, rumble::decode_side(d).lf_hz);
+    TEST_ASSERT_EQUAL_UINT16(320, rumble::decode_side(d).hf_hz);
+    // band-floor (fm code 0 = x0.25): low 40 Hz, high 80 Hz
+    one7bit(d, 0, 127, 0, 127);
+    TEST_ASSERT_EQUAL_UINT16(40, rumble::decode_side(d).lf_hz);
+    TEST_ASSERT_EQUAL_UINT16(80, rumble::decode_side(d).hf_hz);
+    // monotonic non-decreasing frequency across the code range
+    uint16_t last = 0;
+    for (uint8_t code = 0; code <= 127; code += 8) {
+        one7bit(d, code, 127, code, 127);
+        uint16_t f = rumble::decode_side(d).lf_hz;
+        TEST_ASSERT_GREATER_OR_EQUAL_UINT16(last, f);
+        last = f;
     }
 }
 
-static void test_rumble_pad_tone(void) {
+static void test_rumble_differential_stateful(void) {
+    // the codec is differential: a SideDecoder must carry state across packets.
+    rumble::SideDecoder dec;
+    uint8_t d[4];
+    one7bit(d, 64, 127, 64, 127);          // absolute: full amp, center freq
+    rumble::Decoded a = dec.decode(d);
+    TEST_ASSERT_EQUAL_UINT16(rumble::MAX_AMP, a.lf_amp);
+
+    // 5-bit code 11 = Substitute amplitude to -5.0 (quieter), frequency Ignore
+    one5bit(d, 11, 11);
+    rumble::Decoded b = dec.decode(d);
+    TEST_ASSERT_TRUE(b.lf_amp > 0 && b.lf_amp < a.lf_amp); // dropped, not off
+    TEST_ASSERT_EQUAL_UINT16(160, b.lf_hz);                // freq untouched
+
+    // 5-bit code 17 = Sum +amp; applying the SAME packet twice keeps rising,
+    // proving identical bytes are NOT idempotent under the stateful codec.
+    one5bit(d, 17, 17);
+    uint16_t once = dec.decode(d).lf_amp;
+    uint16_t twice = dec.decode(d).lf_amp;
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT16(b.lf_amp, once);
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT16(once, twice);
+
+    // a fresh decoder starts silent
+    rumble::SideDecoder fresh_dec;
+    one7bit(d, 64, 0, 64, 0);
+    rumble::Decoded z = fresh_dec.decode(d);
+    TEST_ASSERT_EQUAL_UINT16(0, z.lf_amp);
+    TEST_ASSERT_EQUAL_UINT16(0, z.hf_amp);
+}
+
+static void test_rumble_amp_to_db(void) {
     // amp_to_db: full = 0 dB, half ~ -6 dB, floor -40, off -128
     TEST_ASSERT_EQUAL_INT8(0, rumble::amp_to_db(1003));
     TEST_ASSERT_EQUAL_INT8(-6, rumble::amp_to_db(503));
     TEST_ASSERT_EQUAL_INT8(-20, rumble::amp_to_db(100));
     TEST_ASSERT_EQUAL_INT8(-40, rumble::amp_to_db(1));
     TEST_ASSERT_EQUAL_INT8(-128, rumble::amp_to_db(0));
+}
 
-    // high band off -> inactive tone
-    rumble::Decoded d{};
-    d.lf_amp = 1003; d.lf_hz = 160; // low band alone never makes a tone
-    rumble::PadTonePacket t = rumble::to_pad_tone(0, d);
-    TEST_ASSERT_FALSE(t.active);
+static void test_rumble_to_tone(void) {
+    // amp 0 or freq 0 -> inactive (no tone), but side byte is still set, and the
+    // bytes carry a ready-to-send stop (gain floor) for the release edge.
+    rumble::TonePacket off = rumble::to_tone(3, 160, 0, 0);
+    TEST_ASSERT_FALSE(off.active);
+    TEST_ASSERT_EQUAL_HEX8(0x83, off.bytes[0]);
+    TEST_ASSERT_EQUAL_HEX8(3, off.bytes[1]);
+    TEST_ASSERT_EQUAL_INT8(rumble::GAIN_MIN_DB, (int8_t)off.bytes[2]); // stop = gain floor
+    TEST_ASSERT_FALSE(rumble::to_tone(3, 0, 1003, 0).active); // freq 0 -> inactive
 
-    // high band on -> 0x83 [side, gain_db, freq, dur, lfo=0, depth=0]
-    d.hf_amp = 503; d.hf_hz = 320;
-    t = rumble::to_pad_tone(1, d);
+    // active tone -> 0x83 [side, gain_db, freq, dur, lfo=0, depth=0]
+    rumble::TonePacket t = rumble::to_tone(1, 320, 503, 0);
     TEST_ASSERT_TRUE(t.active);
     TEST_ASSERT_EQUAL_HEX8(0x83, t.bytes[0]);
     TEST_ASSERT_EQUAL_HEX8(1, t.bytes[1]); // right pad
-    TEST_ASSERT_EQUAL_INT8(-6, (int8_t)t.bytes[2]);
+    TEST_ASSERT_EQUAL_INT8(rumble::amp_to_db(503), (int8_t)t.bytes[2]);
     TEST_ASSERT_EQUAL_UINT16(320, (uint16_t)(t.bytes[3] | (t.bytes[4] << 8)));
     TEST_ASSERT_EQUAL_UINT16(rumble::TONE_DURATION_MS,
                              (uint16_t)(t.bytes[5] | (t.bytes[6] << 8)));
-    TEST_ASSERT_EQUAL_HEX8(0, t.bytes[7]);
-    TEST_ASSERT_EQUAL_HEX8(0, t.bytes[8]);
-    TEST_ASSERT_EQUAL_HEX8(0, t.bytes[9]);
+    TEST_ASSERT_EQUAL_HEX8(0, t.bytes[7]); // lfo_freq lo
+    TEST_ASSERT_EQUAL_HEX8(0, t.bytes[8]); // lfo_freq hi
+    TEST_ASSERT_EQUAL_HEX8(0, t.bytes[9]); // lfo_depth
+
+    // trim_db adds to the amplitude-derived gain
+    TEST_ASSERT_EQUAL_INT8((int8_t)(rumble::amp_to_db(503) - 6),
+                           (int8_t)rumble::to_tone(1, 320, 503, -6).bytes[2]);
+    // trim clamps to the ceiling/floor
+    TEST_ASSERT_EQUAL_INT8(rumble::GAIN_MAX_DB,
+                           (int8_t)rumble::to_tone(3, 160, 1003, 100).bytes[2]);
+    TEST_ASSERT_EQUAL_INT8(rumble::GAIN_MIN_DB,
+                           (int8_t)rumble::to_tone(3, 160, 1, -100).bytes[2]);
+
+    // gain tracks amplitude (louder amp -> higher dB), monotonic
+    int8_t last = -128;
+    for (uint16_t a = 1; a <= 1003; a += 100) {
+        rumble::TonePacket x = rumble::to_tone(3, 160, a, 0);
+        TEST_ASSERT_TRUE(x.active);
+        TEST_ASSERT_GREATER_OR_EQUAL_INT8(last, (int8_t)x.bytes[2]);
+        last = (int8_t)x.bytes[2];
+    }
+
+    // frequency is clamped into the codec range
+    TEST_ASSERT_EQUAL_UINT16(rumble::FREQ_MIN_HZ,
+        (uint16_t)(rumble::to_tone(3, 1, 1003, 0).bytes[3] |
+                   (rumble::to_tone(3, 1, 1003, 0).bytes[4] << 8)));
+    TEST_ASSERT_EQUAL_UINT16(rumble::FREQ_MAX_HZ,
+        (uint16_t)(rumble::to_tone(0, 5000, 1003, 0).bytes[3] |
+                   (rumble::to_tone(0, 5000, 1003, 0).bytes[4] << 8)));
+}
+
+static void test_rumble_corr_db(void) {
+    // empty / null table -> no correction
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, rumble::corr_db(nullptr, 0, 200));
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, rumble::corr_db(rumble::GRIP_CORR, 0, 200)); // n=0
+
+    // exact table points are returned as-is
+    const rumble::CorrPoint* g = rumble::GRIP_CORR;
+    size_t n = rumble::GRIP_CORR_N;
+    TEST_ASSERT_EQUAL_FLOAT(g[0].db, rumble::corr_db(g, n, g[0].hz));
+    TEST_ASSERT_EQUAL_FLOAT(g[5].db, rumble::corr_db(g, n, g[5].hz));
+
+    // held flat past either end
+    TEST_ASSERT_EQUAL_FLOAT(g[0].db, rumble::corr_db(g, n, 1));
+    TEST_ASSERT_EQUAL_FLOAT(g[n - 1].db, rumble::corr_db(g, n, 5000));
+
+    // interpolated point sits between its neighbours (171->193 Hz, both +12)
+    float mid = rumble::corr_db(g, n, 182);
+    TEST_ASSERT_FLOAT_WITHIN(0.1f, 12.0f, mid);
+
+    // and to_tone folds the EQ into the gain: same (side,freq,amp,trim) with the
+    // grip table differs from flat by lroundf(corr_db) at that frequency.
+    int8_t flat = (int8_t)rumble::to_tone(3, 105, 503, 0).bytes[2];
+    int8_t eq = (int8_t)rumble::to_tone(3, 105, 503, 0, g, n).bytes[2];
+    TEST_ASSERT_EQUAL_INT8((int8_t)(flat + lroundf(rumble::corr_db(g, n, 105))), eq);
 }
 
 static void test_rumble_state_via_output_reports(void) {
     fresh();
     // rumble-only output report 0x10 with a strong left effect
     uint8_t buf[10] = {0x10, 0x01};
-    rumble::encode_side(buf + 2, 320, 160, 1003); // left
-    rumble::encode_side(buf + 6, 320, 160, 0);    // right off
+    one7bit(buf + 2, 64, 127, 64, 127); // left: full amp, center freqs
+    one7bit(buf + 6, 64, 0, 64, 0);     // right off
     C->handle_output(buf, sizeof(buf), NOW);
     TEST_ASSERT_TRUE(C->take_rumble_dirty());
     TEST_ASSERT_FALSE(C->take_rumble_dirty()); // edge-triggered
@@ -562,9 +621,17 @@ static void test_rumble_state_via_output_reports(void) {
     TEST_ASSERT_EQUAL_UINT16(1003, C->rumble_state().left().lf_amp);
     TEST_ASSERT_EQUAL_UINT16(1003, C->rumble_state().left().hf_amp);
     TEST_ASSERT_EQUAL_UINT16(0, C->rumble_state().right().lf_amp);
-    // left high band (320 Hz @ full) -> left pad tone; right pad silent
-    TEST_ASSERT_TRUE(C->rumble_state().pad(0).active);
-    TEST_ASSERT_FALSE(C->rumble_state().pad(1).active);
+    // left full both bands -> left grip + left pad tones; right actuators silent
+    TEST_ASSERT_TRUE(C->rumble_state().tone(rumble::ACT_L_GRIP).active);
+    TEST_ASSERT_TRUE(C->rumble_state().tone(rumble::ACT_L_PAD).active);
+    TEST_ASSERT_FALSE(C->rumble_state().tone(rumble::ACT_R_GRIP).active);
+    TEST_ASSERT_FALSE(C->rumble_state().tone(rumble::ACT_R_PAD).active);
+    // left grip tone carries the low band at its true frequency (160 Hz)
+    {
+        const rumble::TonePacket& g = C->rumble_state().tone(rumble::ACT_L_GRIP);
+        TEST_ASSERT_EQUAL_HEX8(3, g.bytes[1]); // left grip side
+        TEST_ASSERT_EQUAL_UINT16(160, (uint16_t)(g.bytes[3] | (g.bytes[4] << 8)));
+    }
 
     // same data again: no change, no dirty flag
     C->handle_output(buf, sizeof(buf), NOW + 1000);
@@ -589,11 +656,13 @@ int main(int, char**) {
     RUN_TEST(test_quat_pack_at_rest);
     RUN_TEST(test_tick_pacing);
     RUN_TEST(test_rumble_neutral);
-    RUN_TEST(test_rumble_amp_inversion);
+    RUN_TEST(test_rumble_amp_levels);
     RUN_TEST(test_rumble_band_amps_independent);
-    RUN_TEST(test_rumble_freq_inversion);
-    RUN_TEST(test_rumble_to_sc);
-    RUN_TEST(test_rumble_pad_tone);
+    RUN_TEST(test_rumble_freq_levels);
+    RUN_TEST(test_rumble_differential_stateful);
+    RUN_TEST(test_rumble_amp_to_db);
+    RUN_TEST(test_rumble_to_tone);
+    RUN_TEST(test_rumble_corr_db);
     RUN_TEST(test_rumble_state_via_output_reports);
     return UNITY_END();
 }

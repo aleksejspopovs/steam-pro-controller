@@ -48,8 +48,9 @@ Snapshot snapshot();
 // Drain one IMU sample (host -> device resampler). Returns false when empty.
 bool pop_imu(xl::ImuSample& s, uint64_t& t_us);
 
-// Device -> host: latest decoded grip rumble (0x80 packet incl. report id).
-// Call on change; task() handles the <=40 ms resend while active.
-void set_rumble(const uint8_t grip[10], bool active);
+// Device -> host: latest HD-rumble as four 0x83 tones (L grip, R grip, L pad,
+// R pad), each a 10-byte output report incl. id. Call on change; task() resends
+// each active tone <=40 ms and lets silent ones expire by duration.
+void set_tones(const uint8_t tones[4][10], const bool active[4]);
 
 } // namespace puck_host

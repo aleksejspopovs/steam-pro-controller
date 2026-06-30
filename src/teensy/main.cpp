@@ -125,7 +125,13 @@ void loop() {
 #ifndef NO_RUMBLE
     if (g_pro.take_rumble_dirty()) {
         const rumble::State& rs = g_pro.rumble_state();
-        puck_host::set_rumble(rs.packet().bytes, rs.active());
+        uint8_t tones[rumble::N_TONE][10];
+        bool active[rumble::N_TONE];
+        for (int a = 0; a < rumble::N_TONE; a++) {
+            memcpy(tones[a], rs.tone(a).bytes, 10);
+            active[a] = rs.tone(a).active;
+        }
+        puck_host::set_tones(tones, active);
     }
 #else
     (void)g_pro.take_rumble_dirty();
