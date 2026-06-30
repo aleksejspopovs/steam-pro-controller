@@ -64,7 +64,9 @@ enum Actuator : uint8_t { ACT_L_GRIP = 0, ACT_R_GRIP = 1, ACT_L_PAD = 2, ACT_R_P
 
 constexpr size_t TONE_LEN = 10; // 0x83 report incl. id
 
-// 0x83 tone duration; outlives the 40 ms resend cadence, dies fast on stop.
+// 0x83 tone duration; just has to outlive the 40 ms resend cadence. On release
+// the consumer sends an explicit stop (see to_tone / TonePacket), so decay no
+// longer waits out this duration -- it can be generous without a sluggish tail.
 constexpr uint16_t TONE_DURATION_MS = 100;
 
 // Tuning. The output gain of one tone is:
@@ -127,7 +129,8 @@ float corr_db(const CorrPoint* tbl, size_t n, uint16_t hz);
 
 struct TonePacket {
     uint8_t bytes[TONE_LEN] = {0x83, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-    bool active = false; // false = don't send; a playing tone expires by duration
+    bool active = false; // false: bytes hold a stop (gain floor); send once on
+                         // the active->inactive edge, then stop refreshing.
 };
 
 // Build one actuator's 0x83 tone from a band's (freq, amp). side = 0x83 `side`

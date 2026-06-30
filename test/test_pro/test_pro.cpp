@@ -533,11 +533,13 @@ static void test_rumble_amp_to_db(void) {
 }
 
 static void test_rumble_to_tone(void) {
-    // amp 0 or freq 0 -> inactive (no tone), but side byte is still set
+    // amp 0 or freq 0 -> inactive (no tone), but side byte is still set, and the
+    // bytes carry a ready-to-send stop (gain floor) for the release edge.
     rumble::TonePacket off = rumble::to_tone(3, 160, 0, 0);
     TEST_ASSERT_FALSE(off.active);
     TEST_ASSERT_EQUAL_HEX8(0x83, off.bytes[0]);
     TEST_ASSERT_EQUAL_HEX8(3, off.bytes[1]);
+    TEST_ASSERT_EQUAL_INT8(rumble::GAIN_MIN_DB, (int8_t)off.bytes[2]); // stop = gain floor
     TEST_ASSERT_FALSE(rumble::to_tone(3, 0, 1003, 0).active); // freq 0 -> inactive
 
     // active tone -> 0x83 [side, gain_db, freq, dur, lfo=0, depth=0]

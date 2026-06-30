@@ -181,8 +181,13 @@ TonePacket to_tone(uint8_t side, uint16_t freq_hz, uint16_t amp, int8_t trim_db,
                    const CorrPoint* corr, size_t corr_n) {
     TonePacket p;
     p.bytes[1] = side;
-    if (amp == 0 || freq_hz == 0)
-        return p; // inactive; a playing tone expires by its duration
+    if (amp == 0 || freq_hz == 0) {
+        // Inactive. The bytes carry a ready-to-send *stop* (gain floor, freq 0,
+        // dur 0): the consumer sends it once on the active->inactive edge so the
+        // actuator goes quiet immediately instead of ringing out TONE_DURATION_MS.
+        p.bytes[2] = (uint8_t)(int8_t)GAIN_MIN_DB;
+        return p;
+    }
 
     // MsgHapticLfoTone: [0x83, side, gain_db, freq, duration_ms, lfo, depth].
     p.active = true;

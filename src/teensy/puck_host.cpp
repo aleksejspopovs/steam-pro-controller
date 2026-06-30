@@ -104,6 +104,10 @@ uint8_t g_last_imu[12] = {}; // accel(34..39)+gyro(40..45); NOT the ts counter
 // rumble (device -> host): four 0x83 tones -- L grip, R grip, L pad, R pad
 uint8_t g_tones[4][10] = {{0x83}, {0x83}, {0x83}, {0x83}};
 volatile bool g_tone_active[4] = {false, false, false, false};
+// One-shot: set when an actuator goes active->inactive so the next emit pass
+// sends its stop packet (g_tones[a] now holds the stop) instead of just letting
+// the tone ring out its duration. Poll-context only; not touched by the ISR.
+bool g_tone_stop[4] = {false, false, false, false};
 volatile bool g_rumble_active = false; // any tone active
 volatile bool g_rumble_dirty = false;
 uint32_t g_rumble_resend_ms = 0;
@@ -460,16 +464,18 @@ void task(uint32_t now_ms) {
     }
 
     // rumble back-path: forward on change, resend <=40 ms while active. Each
-    // active actuator is its own 0x83 output report; silent ones aren't sent
-    // and expire by their tone duration. NOTE: this fires up to four
-    // sendPacket() calls per pass -- confirm the host driver queues them
+    // active actuator is its own 0x83 output report. On the active->inactive
+    // edge we send one explicit stop (g_tone_stop[a]) so the side goes quiet at
+    // once rather than ringing out its tone duration. NOTE: this fires up to
+    // four sendPacket() calls per pass -- confirm the host driver queues them
     // cleanly (vs. dropping/overwriting in-flight) during hardware bring-up.
     if (g_active >= 0 && (g_rumble_dirty ||
                           (g_rumble_active && now_ms >= g_rumble_resend_ms))) {
         g_rumble_dirty = false;
         if (g_slots[g_active].drv) {
             for (int a = 0; a < 4; a++) {
-                if (!g_tone_active[a]) continue;
+                if (!g_tone_active[a] && !g_tone_stop[a]) continue;
+                g_tone_stop[a] = false;  // one-shot: the stop is being sent now
                 static uint8_t out[FEATURE_LEN] __attribute__((aligned(32)));
                 memset(out, 0, sizeof(out));
                 memcpy(out, g_tones[a], sizeof(g_tones[a]));
@@ -505,6 +511,11 @@ bool pop_imu(xl::ImuSample& s, uint64_t& t_us) {
 void set_tones(const uint8_t tones[4][10], const bool active[4]) {
     bool any = false;
     for (int a = 0; a < 4; a++) {
+        // active -> inactive this update: queue a one-shot stop so the side goes
+        // quiet now instead of waiting out its tone duration. (tones[a] for an
+        // inactive actuator already holds the stop packet, from to_tone.)
+        if (g_tone_active[a] && !active[a])
+            g_tone_stop[a] = true;
         memcpy(g_tones[a], tones[a], 10);
         g_tone_active[a] = active[a];
         any |= active[a];
